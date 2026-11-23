@@ -1,0 +1,6 @@
+{
+  "name": "Yusr (يُسر) — Sharia-Compliant Fintech Super App",
+  "description": "Foundational PostgreSQL migrations, deterministic credit scoring engine, and Edge Function checkout router for Yusr.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
