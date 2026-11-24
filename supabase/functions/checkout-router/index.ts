@@ -839,6 +839,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
           contract_type: "qard_hasan",
           profit_amount: 0.0,
           late_fee_bps: 0,
+          tenor_months: Math.min(requestedTenor, 3),
           items: microCreditItems,
           financed_principal: microCreditTotal,
         },
