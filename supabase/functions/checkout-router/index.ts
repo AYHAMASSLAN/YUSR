@@ -1,21 +1,22 @@
 /**
  * ============================================================================
- * Yusr (يُسر) — Checkout Router Edge Function (Step 1: Dry-Run Quote)
+ * Yusr (يُسر) — Checkout Router Edge Function (Dry-Run & Atomic Confirm)
  * ============================================================================
  * File: supabase/functions/checkout-router/index.ts
  * Runtime: Supabase Edge Functions (Deno / TypeScript)
  *
- * Responsibilities in Step 1 (Read-Only Orchestration — NO DB writes yet):
+ * Responsibilities:
  *   1. Authenticate caller via Supabase Auth JWT (never trust body user_id).
- *   2. Validate cart payload & resolve authoritative catalog prices from DB.
+ *   2. Validate cart payload, idempotency_key, and confirm flag.
  *   3. Verify caller's KYC status ('verified') and Credit Tier (A, B, C, D).
- *   4. Compute remaining Micro-Credit & Murabaha headroom from active contracts.
- *   5. Deterministically split the cart into:
- *        - Cash (mandatory down payments, ineligible goods, or overflow)
- *        - Micro-Credit (Qard Hasan: 0% profit, 0 late fees)
- *        - Murabaha (Fixed cost-plus markup, grouped per Merchant)
- *   6. Return the dry-run routing breakdown to the client.
- *      (Atomic DB persistence via PostgreSQL RPC will be wired in Step 2.)
+ *   4. Default (confirm !== true):
+ *        Returns deterministic dry_run: true split quote (Cash / Micro-Credit /
+ *        per-merchant Murabaha) with zero DB writes.
+ *   5. Confirmed (confirm === true):
+ *        Ensures active credit_scores snapshot exists, then calls
+ *        supabaseAdmin.rpc("execute_checkout_atomic", ...) to atomically lock
+ *        limits, deduct stock & bank liquidity, create contracts/installments,
+ *        and post balanced double-entry ledger records.
  * ============================================================================
  */
 
@@ -26,6 +27,7 @@ import {
   CreditTier,
   getTierPolicy,
   roundCurrency,
+  ScoreBreakdown,
   TierPolicy,
 } from "../_shared/scoringRules.ts";
 
@@ -42,6 +44,8 @@ interface CartItemRequest {
 interface CheckoutRouterRequest {
   items: CartItemRequest[];
   requested_tenor_months?: number;
+  confirm?: boolean;
+  idempotency_key?: string;
 }
 
 interface DbProduct {
@@ -190,8 +194,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
   }
 
-  // Service-role client used strictly for internal bank_pools liquidity lookup
-  const poolAdminClient = createClient(supabaseUrl, supabaseServiceKey);
+  // Service-role client used for internal bank_pools lookup, credit score sync, and atomic RPC
+  const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
 
   // 3. Parse & Validate Request Payload
   let payload: CheckoutRouterRequest;
@@ -213,6 +217,27 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
   }
 
+  if (payload.confirm !== undefined && typeof payload.confirm !== "boolean") {
+    return jsonResponse(
+      { error: "'confirm' must be a boolean." },
+      400,
+      corsHeaders,
+    );
+  }
+
+  if (
+    payload.idempotency_key !== undefined &&
+    (typeof payload.idempotency_key !== "string" ||
+      payload.idempotency_key.trim().length === 0 ||
+      payload.idempotency_key.length > 128)
+  ) {
+    return jsonResponse(
+      { error: "'idempotency_key' must be a non-empty string (max 128 chars)." },
+      400,
+      corsHeaders,
+    );
+  }
+
   if (
     payload.requested_tenor_months !== undefined &&
     (typeof payload.requested_tenor_months !== "number" ||
@@ -226,6 +251,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
       corsHeaders,
     );
   }
+
+  const isConfirmMode = payload.confirm === true;
+  const idempotencyKey = payload.idempotency_key?.trim() || crypto.randomUUID();
 
   // Consolidate duplicate product_ids and validate quantities/UUIDs
   const requestedQtyByProduct = new Map<string, number>();
@@ -330,12 +358,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
   let activeTier: CreditTier;
   let activeScore: number;
   let policy: TierPolicy;
+  let computedBreakdown: ScoreBreakdown | null = null;
 
   const isScoreValid =
-    currentScoreRow &&
-    new Date(currentScoreRow.expires_at).getTime() > Date.now();
+    Boolean(currentScoreRow) &&
+    new Date(currentScoreRow!.expires_at).getTime() > Date.now();
 
-  if (isScoreValid) {
+  if (isScoreValid && currentScoreRow) {
     activeTier = currentScoreRow.tier as CreditTier;
     activeScore = currentScoreRow.score;
     policy = {
@@ -394,6 +423,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     activeTier = computed.tier;
     activeScore = computed.score;
     policy = computed.policy;
+    computedBreakdown = computed.breakdown;
   }
 
   // Ensure policy aligns with Tier floor if Tier D
@@ -518,12 +548,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   // 8. Fetch Best Active Islamic Bank Liquidity Pool for Murabaha Quote
-  const { data: activePools, error: poolErr } = await poolAdminClient
+  const { data: activePools, error: poolErr } = await supabaseAdmin
     .from("bank_pools")
     .select("id, partner_bank_name, available_liquidity, murabaha_markup_bps, late_fee_bps")
     .eq("is_active", true)
     .gt("available_liquidity", 0)
     .order("murabaha_markup_bps", { ascending: true })
+    .order("id", { ascending: true })
     .limit(1);
 
   if (poolErr) {
@@ -546,7 +577,104 @@ Deno.serve(async (req: Request): Promise<Response> => {
       ? Math.max(1, Math.min(payload.requested_tenor_months, policy.maxTenorMonths))
       : policy.maxTenorMonths;
 
-  // 9. Deterministic Split-Routing Engine (Cash -> Micro-Credit -> Murabaha)
+  // Sort cart items deterministically by product_id ASC to match execute_checkout_atomic
+  const sortedCartEntries = Array.from(requestedQtyByProduct.entries()).sort(
+    ([a], [b]) => (a < b ? -1 : a > b ? 1 : 0),
+  );
+
+  // 8b. Confirmed Execution Branch (confirm: true -> Atomic PostgreSQL RPC)
+  if (isConfirmMode) {
+    // Persist freshly calculated credit_scores snapshot if missing or expired
+    // so execute_checkout_atomic locks the exact same Tier & limits.
+    if (!isScoreValid && computedBreakdown) {
+      await supabaseAdmin
+        .from("credit_scores")
+        .update({ is_current: false })
+        .eq("user_id", user.id)
+        .eq("is_current", true);
+
+      const { error: scoreInsertErr } = await supabaseAdmin
+        .from("credit_scores")
+        .insert({
+          user_id: user.id,
+          score: activeScore,
+          tier: activeTier,
+          micro_credit_limit: policy.microCreditLimit,
+          murabaha_limit: policy.murabahaLimit,
+          min_down_payment_bps: policy.minDownPaymentBps,
+          max_tenor_months: policy.maxTenorMonths,
+          score_breakdown: computedBreakdown,
+          is_current: true,
+        });
+
+      if (scoreInsertErr) {
+        return jsonResponse(
+          { error: "Failed to persist underwriting score snapshot." },
+          500,
+          corsHeaders,
+        );
+      }
+    }
+
+    const rpcPayload = {
+      idempotency_key: idempotencyKey,
+      requested_tenor_months: requestedTenor,
+      items: sortedCartEntries.map(([product_id, quantity]) => ({
+        product_id,
+        quantity,
+      })),
+    };
+
+    const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc(
+      "execute_checkout_atomic",
+      {
+        p_user_id: user.id,
+        p_payload: rpcPayload,
+      },
+    );
+
+    if (rpcError) {
+      const msg = rpcError.message ?? "Atomic checkout failed.";
+      const statusCode = msg.includes("KYC_NOT_VERIFIED") ||
+          msg.includes("ACCOUNT_RESTRICTED")
+        ? 403
+        : msg.includes("PRODUCT_NOT_FOUND") || msg.includes("USER_NOT_FOUND")
+        ? 404
+        : msg.includes("INSUFFICIENT_STOCK") ||
+            msg.includes("MERCHANT_INACTIVE") ||
+            msg.includes("SHARIA_OR_CATALOG_ERROR")
+        ? 409
+        : 422;
+
+      return jsonResponse(
+        {
+          dry_run: false,
+          confirmed: false,
+          error: msg,
+        },
+        statusCode,
+        corsHeaders,
+      );
+    }
+
+    const isReplay = Boolean(
+      rpcResult &&
+        typeof rpcResult === "object" &&
+        "idempotent_replay" in rpcResult &&
+        rpcResult.idempotent_replay,
+    );
+
+    return jsonResponse(
+      {
+        dry_run: false,
+        ...(rpcResult as Record<string, unknown>),
+      },
+      isReplay ? 200 : 201,
+      corsHeaders,
+    );
+  }
+
+  // 9. Deterministic Split-Routing Preview Engine (confirm !== true -> dry_run: true)
   const cashItems: RoutedLineItem[] = [];
   const microCreditItems: RoutedLineItem[] = [];
   const murabahaByMerchant = new Map<
@@ -558,7 +686,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   let cashTotal = 0;
   let microCreditTotal = 0;
 
-  for (const [productId, qty] of requestedQtyByProduct.entries()) {
+  for (const [productId, qty] of sortedCartEntries) {
     const product = productMap.get(productId)!;
     const unitPrice = roundCurrency(Number(product.unit_price));
     const lineTotal = roundCurrency(unitPrice * qty);
